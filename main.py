@@ -8,12 +8,37 @@ import operator
 from langchain_tavily import TavilySearch
 import os
 from tavily import AsyncTavilyClient
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode, LLMConfig
+from crawl4ai import LLMExtractionStrategy
+
 
 load_dotenv()
 
+
+class ItemPrice(BaseModel):
+    price: float = Field(description="The price of the item. This is usually a number that is easy to understand and convert to a currency. For example, if the price is $100, you should return 100. If the price is $100.00, you should return 100.00. If the price is $100.00 USD, you should return 100.00 USD.")
+
 tavily_client = AsyncTavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 
+crawl4ai_browser_config = BrowserConfig(
+    verbose=True
+)
+crawl4ai_crawler_run_config = CrawlerRunConfig(
+        word_count_threshold=1,
+        extraction_strategy=LLMExtractionStrategy(
+            llm_config = LLMConfig(provider="google/gemini-3-flash-preview", api_token=os.getenv('OPENROUTER_API_KEY')), 
+            schema=ItemPrice.schema(),
+            extraction_type="schema",
+            instruction="""From the crawled content, extract the price of the item. If the price is not found, you should return None."""
+        ),            
+        cache_mode=CacheMode.BYPASS,
+    )
+crawl4ai_crawler = AsyncWebCrawler(config=crawl4ai_browser_config)
 
+
+
+class Candidates(BaseModel):
+    candidates: List[ItemDescription] = Field(description="A list of item descriptions that are candidates for the item that was provided by the user")
 class GeneratedWebSearchQueries(BaseModel):
     queries: List[str] = Field(description="A list of web queries that are generated to find the best candidates for the item")
 
@@ -29,7 +54,7 @@ class ItemDescription(BaseModel):
 class AffordAgentState(TypedDict):
     messages: Annotated[List[AnyMessage], operator.add]
     original_item_description: Optional[ItemDescription] = Field(default=None, description="The original item description that was provided by the user")
-    candidates: List[ItemDescription] = Field(default=[], description="A list of item descriptions that are candidates for the item that was provided by the user")
+    candidates: Candidates = Field(default=Candidates(candidates=[]), description="A list of item descriptions that are candidates for the item that was provided by the user")
 
 
 
@@ -81,21 +106,28 @@ async def expansive_search(item_description: ItemDescription):
         #  now here a good thing to do would be to compare the image descriptions with the item description and see if they are similar, if they are, then we can append to responses. We can use an LLM to do that.
         results.append(response)
 
+    print("Results: ", results)
+
 
     for result in results:
-        for image in result.images:
-            image_description = image.description
-            image_url = image.url
-            
-
-    
-
-    
+        for item in result.images:
+            image_description = item.description
+            image_url = item.url
+            response = await crawl4ai_crawler.arun(url=image_url, run_config=crawl4ai_crawler_run_config)
+            print("Response from crawl4ai: ", response)
+            item["price"] = response.item_price.price
 
 
-
-
-
+    print(f"Genering a list of candidates for the item: {item_description.model_dump_json()}")
+    model_with_structured_output = model.with_structured_output(Candidates)
+    response = await model_with_structured_output.ainvoke({
+        "messages": [
+            SystemMessage(content="You are a helpful assistant that can generate a list of candidates for the item given a list of candidate items and their descriptions"),
+            HumanMessage(content=f"Generate a list of candidates for the item with the following descriptions: {item_description.model_dump_json()} and the following candidates: {results}")
+        ]
+    })
+    print("Response from model: ", response)
+    return response.candidates
 
 tools = [get_item_description, get_item_price]
 model.bind_tools(tools)
